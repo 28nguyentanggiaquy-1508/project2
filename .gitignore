@@ -1,0 +1,55 @@
+.env
+*.env
+!.env.example
+
+backend/.env
+frontend/.env.local
+
+node_modules/
+venv/
+__pycache__/
+.next/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment / API keys
+.env
+*.env
+
+# Cache
+.cache/
+huggingface_cache/
+.cache_huggingface/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Dataset / generated data
+data/
+datasets/
+outputs/
+results/
+
+# Temporary files
+*.tmp
