@@ -10,3 +10,5 @@ underthesea
 google-genai
 pyvi
 emoji
+beautifulsoup4
+Pillow

@@ -6,9 +6,11 @@ from services.ai_service import analyze_video
 from core.model_manager import get_default_model_id, list_model_options
 from core.gemini_vision import get_or_download_video
 from typing import Optional
+from api.fact_check import router as fact_check_router
 
 
 app = FastAPI()
+app.include_router(fact_check_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

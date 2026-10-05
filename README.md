@@ -168,3 +168,7 @@ Backend vẫn có thể khởi động khi thiếu key, nhưng phần phân tíc
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+$env:JAVA_HOME="C:\Program Files\Java\jdk-21.0.10"
+$env:Path="$env:JAVA_HOME\bin;$env:Path"
+Test-Path "$env:JAVA_HOME\bin\java.exe"
+python -c "import os; print(os.environ.get('JAVA_HOME'))"

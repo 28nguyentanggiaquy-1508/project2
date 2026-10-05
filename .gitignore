@@ -53,3 +53,13 @@ results/
 
 # Temporary files
 *.tmp
+
+# Media & Video Cache
+.video_cache/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.wav
+*.mp3

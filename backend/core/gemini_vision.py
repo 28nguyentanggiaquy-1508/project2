@@ -15,7 +15,9 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_VISION_MODEL,
 )
-
+from core.gemini_utils import (
+    generate_content_with_retry,
+)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -510,6 +512,50 @@ def analyze_tiktok_video_context(video_url: str, comments=None) -> dict:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+# ============================================================
+# LEGACY PUBLIC COMPATIBILITY API
+# ============================================================
+
+def build_local_emotion_report(
+    summary: dict,
+    emotions: dict,
+    video_context=None,
+    comments=None,
+    **kwargs,
+) -> str:
+    """
+    Compatibility wrapper cho các service legacy.
+
+    Không thuộc pipeline Fact-Checking V2.
+    """
+
+    return _local_emotion_report(
+        summary=summary or {},
+        emotions=emotions or {},
+        video_context=video_context,
+    )
+
+
+def generate_emotion_analyst_report(
+    summary: dict,
+    emotions: dict,
+    video_context=None,
+    comments=None,
+    **kwargs,
+) -> str:
+    """
+    Compatibility wrapper cho:
+        services/analyst_cache_service.py
+
+    Tái sử dụng Gemini analyst cũ thông qua analyze_video_context().
+    """
+
+    return analyze_video_context(
+        summary=summary or {},
+        emotions=emotions or {},
+        video_context=video_context,
+        comments=comments or [],
+    )
 
 def _local_emotion_report(summary: dict, emotions: dict, video_context=None) -> str:
     pos = summary.get("positive", 0)
@@ -559,7 +605,6 @@ Ty le phan hoi tieu cuc: {round(neg_ratio * 100, 1)}%
 De xuat: tiep tuc theo doi cac nhom binh luan noi bat va dieu chinh noi dung theo phan ung cua nguoi xem.
 """.strip()
 
-
 def analyze_video_context(
     summary: dict,
     emotions: dict,
@@ -595,3 +640,560 @@ def analyze_video_context(
         print(f"[Gemini Analyst Error] {exc}")
 
     return _local_emotion_report(summary, emotions, video_context)
+# ============================================================================
+# FACT-CHECKING V2: MULTIMEDIA ANALYSIS + CLAIM EXTRACTION
+# ============================================================================
+# This section is intentionally isolated from the legacy emotion pipeline.
+# The legacy functions above stay unchanged and continue to serve /analyze.
+
+
+def _extract_tiktok_post_metadata(video_url: str) -> dict:
+    """
+    Best-effort extraction of TikTok post metadata without downloading media.
+    The post caption is treated as one possible textual modality.
+    """
+    canonical_url = _resolve_short_url(video_url)
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "http_headers": {
+            "User-Agent": DESKTOP_USER_AGENT,
+            "Referer": "https://www.tiktok.com/",
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(canonical_url, download=False) or {}
+
+        caption = (
+            info.get("description")
+            or info.get("title")
+            or ""
+        )
+
+        return {
+            "caption": str(caption).strip(),
+            "uploader": str(info.get("uploader") or "").strip(),
+            "uploader_id": str(info.get("uploader_id") or "").strip(),
+            "upload_date": str(info.get("upload_date") or "").strip(),
+            "duration": info.get("duration"),
+            "webpage_url": str(info.get("webpage_url") or canonical_url).strip(),
+        }
+    except Exception as exc:
+        print(f"[FactCheck Metadata] could not read TikTok metadata: {exc}")
+        return {
+            "caption": "",
+            "uploader": "",
+            "uploader_id": "",
+            "upload_date": "",
+            "duration": None,
+            "webpage_url": canonical_url,
+        }
+
+
+def _build_fact_check_multimedia_prompt(post_caption: str = "") -> str:
+    """
+    Phase 2 prompt for multimedia observation + claim extraction.
+
+    Important separation of responsibilities:
+    - always analyze observable video modalities first;
+    - only then decide whether a checkable/check-worthy claim exists;
+    - never perform evidence retrieval or verdict prediction here.
+    """
+    caption_text = post_caption.strip() or "(khong co caption metadata)"
+
+    return f"""
+# VAI TRO
+
+Ban la module Multimedia Claim Extraction trong he thong
+Multimodal Automated Fact-Checking cho video TikTok.
+
+BUOC NAY CO HAI NHIEM VU TACH BIET:
+A. BAT BUOC phan tich multimedia trong video.
+B. Sau do moi xac dinh co factual claim can kiem chung hay khong.
+
+KHONG DUOC fact-check va KHONG DUOC dua ra verdict.
+
+
+# A. MULTIMEDIA EXTRACTION - BAT BUOC
+
+Ngay ca khi video KHONG co factual claim can kiem chung,
+ban VAN PHAI phan tich noi dung nhin/nghe/doc duoc.
+
+1. VISUAL
+- nguoi, nhan vat, vat the, boi canh, hanh dong;
+- do hoa, bieu do, anh chen, canh phim/anime/game neu co;
+- chi mo ta nhung gi quan sat duoc.
+
+2. SPEECH
+- trich loi noi co the nghe duoc;
+- ghi dung y nghia;
+- neu khong nghe ro thi khong tu doan.
+
+3. OCR
+- chu tren man hinh;
+- phu de, tieu de, ten rieng, dia diem, ngay thang, so lieu;
+- neu khong doc duoc thi khong tu tao.
+
+4. CAPTION / POST TEXT
+- caption metadata duoc cung cap ben duoi;
+- day la mot modality text rieng;
+- khong coi caption la su that chi vi no xuat hien.
+
+5. CROSS-MODAL
+- neu loi noi, OCR, caption va hinh anh cung bo tro hoac mau thuan nhau,
+  ghi ngan gon vao cross_modal_notes.
+
+QUY TAC BAT BUOC:
+- candidate_claims CO THE la [].
+- NHUNG khong duoc de dong thoi visual_observations,
+  speech_segments va ocr_segments deu rong neu video thuc su
+  co noi dung nhin/nghe/doc duoc.
+- Neu mot modality thuc su khong co du lieu, modality do co the rong.
+
+
+# CONTENT TYPE
+
+Phan loai noi dung vao DUNG MOT gia tri:
+- real_world: noi dung chu yeu noi ve su kien/thuc te doi thuc;
+- fictional: phim, anime, truyen hu cau, fan-edit, parody, gameplay
+  hoac noi dung hu cau ro rang;
+- mixed: ket hop noi dung hu cau va factual claim doi thuc;
+- uncertain: khong du thong tin de phan loai chac chan.
+
+Neu video la fictional:
+- van phai phan tich visual/speech/OCR day du;
+- KHONG bien tinh tiet hu cau thanh factual claim ngoai doi thuc.
+
+
+# FACT VA INTERPRETATION
+
+FACT_OBSERVED:
+nhung gi co the truc tiep nhin thay, nghe thay hoac doc duoc.
+
+INTERPRETATION:
+suy luan cua mo hinh.
+
+KHONG bien INTERPRETATION thanh factual claim.
+
+
+# B. CLAIM DETECTION / EXTRACTION
+
+Chi dua vao candidate_claims neu noi dung:
+- mang tinh factual;
+- ve nguyen tac co the xac minh bang bang chung;
+- co y nghia kiem chung trong boi canh doi thuc;
+- khong chi la cam xuc, y kien ca nhan, cau dua, loi keu goi;
+- neu claim ngan ngam tu nhieu modality, ghi source_modality = "cross_modal".
+
+Cac nhom claim:
+- statistical:
+  so lieu, ty le, so luong;
+- event_place_person:
+  su kien, dia diem, nhan vat, to chuc;
+- other_factual:
+  factual claim khac;
+- authenticity_context:
+  claim ve nguon goc, thoi gian, dia diem, tinh xac thuc
+  hoac boi canh cua anh/video.
+
+Neu khong co claim du kha nang kiem chung:
+candidate_claims = [].
+
+
+# CAM TUYET DOI
+
+KHONG DUOC:
+- ket luan SUPPORTED;
+- ket luan REFUTED;
+- ket luan NEI;
+- tao external evidence;
+- dung kien thuc nen de kiem chung claim;
+- bia danh tinh;
+- suy doan thong tin rieng tu;
+- coi caption/OCR/loi noi la su that chi vi no xuat hien.
+
+
+# CAPTION METADATA
+
+{caption_text}
+
+
+# OUTPUT
+
+Tra ve DUY NHAT JSON hop le:
+
+{{
+  "content_type": "real_world | fictional | mixed | uncertain",
+
+  "visual_observations": [
+    {{
+      "timestamp": "00:00-00:05",
+      "fact": "..."
+    }}
+  ],
+
+  "speech_segments": [
+    {{
+      "timestamp": "00:00-00:05",
+      "text": "..."
+    }}
+  ],
+
+  "speech_transcript": "...",
+
+  "ocr_segments": [
+    {{
+      "timestamp": "00:00-00:05",
+      "text": "..."
+    }}
+  ],
+
+  "ocr_text": "...",
+
+  "caption": "...",
+
+  "candidate_claims": [
+    {{
+      "id": "claim_01",
+      "text": "...",
+      "source_modality": "speech | ocr | caption | visual | cross_modal",
+      "timestamp": "00:00-00:05",
+      "checkable": true,
+      "check_worthy": true,
+      "claim_type": "statistical | event_place_person | other_factual | authenticity_context",
+      "rationale": "..."
+    }}
+  ],
+
+  "cross_modal_notes": [
+    "..."
+  ]
+}}
+""".strip()
+
+
+def _normalize_fact_check_payload(data: dict, metadata: dict) -> dict:
+    """Defensive normalization before Pydantic validation in Phase 2."""
+    if not isinstance(data, dict):
+        data = {}
+
+    def _list_of_dicts(value):
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
+    def _list_of_strings(value):
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    content_type = str(
+        data.get("content_type") or "uncertain"
+    ).strip().lower()
+
+    if content_type not in {
+        "real_world",
+        "fictional",
+        "mixed",
+        "uncertain",
+    }:
+        content_type = "uncertain"
+
+    caption = str(
+        data.get("caption")
+        or metadata.get("caption")
+        or ""
+    ).strip()
+
+    return {
+        "content_type": content_type,
+        "visual_observations": _list_of_dicts(data.get("visual_observations")),
+        "speech_segments": _list_of_dicts(data.get("speech_segments")),
+        "speech_transcript": str(data.get("speech_transcript") or "").strip(),
+        "ocr_segments": _list_of_dicts(data.get("ocr_segments")),
+        "ocr_text": str(data.get("ocr_text") or "").strip(),
+        "caption": caption or None,
+        "candidate_claims": _list_of_dicts(data.get("candidate_claims")),
+        "cross_modal_notes": _list_of_strings(data.get("cross_modal_notes")),
+        "metadata": metadata,
+    }
+
+def _build_caption_fallback_claims(
+    caption: str,
+) -> list[dict]:
+    """
+    Fallback nhẹ khi VLM/Gemini tạm thời không khả dụng.
+
+    Chỉ tạo candidate claim khi caption có dấu hiệu factual rõ ràng.
+    Hàm này không thay thế claim extractor chính và không đưa ra verdict.
+    """
+
+    import re
+
+    caption = str(caption or "").strip()
+    if not caption:
+        return []
+
+    # Bỏ hashtag để claim sạch hơn.
+    cleaned = re.sub(r"#\S+", " ", caption)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if len(cleaned) < 10:
+        return []
+
+    # Heuristic tối thiểu cho fallback.
+    # Đây chỉ là cơ chế dự phòng khi VLM lỗi, không phải bộ phân loại claim chính.
+    factual_patterns = [
+        r"\bhiện\s+có\s+\d+",
+        r"\bcó\s+\d+\b",
+        r"\bnăm\s+\d{4}\b",
+        r"\bngày\s+\d{1,2}[/-]\d{1,2}",
+        r"\bđược\s+công\s+bố\b",
+        r"\bđược\s+ban\s+hành\b",
+        r"\bcông\s+bố\s+rằng\b",
+    ]
+
+    is_factual = any(
+        re.search(pattern, cleaned, flags=re.IGNORECASE)
+        for pattern in factual_patterns
+    )
+
+    if not is_factual:
+        return []
+
+    claim_type = (
+        "statistical"
+        if re.search(r"\d", cleaned)
+        else "other_factual"
+    )
+
+    return [
+        {
+            "id": "claim_caption_01",
+            "text": cleaned,
+            "source_modality": "caption",
+            "timestamp": None,
+            "checkable": True,
+            "check_worthy": True,
+            "claim_type": claim_type,
+            "rationale": (
+                "Fallback claim được trích trực tiếp từ caption TikTok "
+                "khi VLM video tạm thời không khả dụng."
+            ),
+        }
+    ]
+
+
+def _build_multimedia_fallback_result(
+    metadata: dict,
+    *,
+    source: str,
+    error: str,
+) -> dict:
+    """
+    Tạo response fallback nhất quán cho Phase 2.
+
+    Nếu caption có factual claim rõ ràng, pipeline vẫn có thể tiếp tục sang
+    Evidence Retrieval dù visual/speech/OCR chưa có vì Gemini bị lỗi.
+    """
+
+    result = _normalize_fact_check_payload({}, metadata)
+
+    caption = str(metadata.get("caption") or "").strip()
+    fallback_claims = _build_caption_fallback_claims(caption)
+
+    if fallback_claims:
+        result["candidate_claims"] = fallback_claims
+        result["source"] = "caption_fallback"
+        result["cross_modal_notes"] = [
+            "VLM video không khả dụng; candidate claim được lấy từ caption metadata."
+        ]
+        result.setdefault("metadata", {})[
+            "caption_claim_fallback_used"
+        ] = True
+        result.setdefault("metadata", {})[
+            "multimedia_failure_source"
+        ] = source
+    else:
+        result["source"] = source
+
+    result["error"] = error
+    return result
+
+
+def analyze_tiktok_multimedia(
+    video_url: str,
+) -> dict:
+    """
+    Phase 2 - Multimedia Analysis + Claim Extraction.
+
+    TikTok URL
+        -> Visual
+        -> Speech
+        -> OCR
+        -> Caption
+        -> Candidate Claims
+
+    Không thực hiện:
+    - evidence retrieval
+    - verdict prediction
+    - explanation generation
+    """
+
+    metadata = _extract_tiktok_post_metadata(video_url)
+
+    # ========================================================
+    # GEMINI NOT AVAILABLE
+    # ========================================================
+    if not _gemini_ready():
+        return _build_multimedia_fallback_result(
+            metadata,
+            source="gemini_unavailable",
+            error="GEMINI_API_KEY is missing",
+        )
+
+    temp_dir = None
+    uploaded_file = None
+
+    try:
+        # ====================================================
+        # 1. DOWNLOAD VIDEO
+        # ====================================================
+        video_path, temp_dir = _download_tiktok_video(video_url)
+
+        # ====================================================
+        # 2. CACHE VIDEO
+        # ====================================================
+        video_id = _video_id_from_url(video_url)
+
+        if video_id:
+            try:
+                shutil.copy2(
+                    video_path,
+                    VIDEO_CACHE_DIR / f"{video_id}.mp4",
+                )
+            except Exception as cache_exc:
+                print(
+                    "[FactCheck Multimedia] cache copy failed: "
+                    f"{cache_exc}"
+                )
+
+        # ====================================================
+        # 3. UPLOAD VIDEO TO GEMINI
+        # ====================================================
+        uploaded_file = _upload_video_to_gemini(video_path)
+
+        # ====================================================
+        # 4. BUILD PROMPT
+        # ====================================================
+        caption = str(metadata.get("caption") or "").strip()
+        prompt = _build_fact_check_multimedia_prompt(caption)
+
+        # ====================================================
+        # 5. GEMINI + RETRY
+        # ====================================================
+        retry_result = generate_content_with_retry(
+            gemini_client,
+            model=GEMINI_VISION_MODEL,
+            contents=[prompt, uploaded_file],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+
+        # Defensive check để tránh lỗi biến chưa được khởi tạo nếu helper
+        # bị sửa sai ở nơi khác.
+        if (
+            not isinstance(retry_result, tuple)
+            or len(retry_result) != 2
+        ):
+            raise RuntimeError(
+                "generate_content_with_retry() must return "
+                "(response, model_used)."
+            )
+
+        response, model_used = retry_result
+
+        if response is None:
+            raise RuntimeError("Gemini returned None response.")
+
+        # ====================================================
+        # 6. PARSE GEMINI RESPONSE
+        # ====================================================
+        response_text = _response_text(response)
+        data = _extract_json(response_text)
+
+        if not data:
+            raise RuntimeError(
+                "Gemini returned empty or invalid multimedia JSON."
+            )
+
+        # ====================================================
+        # 7. NORMALIZE
+        # ====================================================
+        result = _normalize_fact_check_payload(data, metadata)
+
+        # Nếu VLM thành công nhưng bỏ sót một factual claim rất rõ trong
+        # caption, dùng caption heuristic làm fallback bổ sung.
+        if not result.get("candidate_claims"):
+            caption_claims = _build_caption_fallback_claims(
+                result.get("caption") or ""
+            )
+            if caption_claims:
+                result["candidate_claims"] = caption_claims
+                result.setdefault("cross_modal_notes", []).append(
+                    "VLM không tạo candidate claim; hệ thống bổ sung một "
+                    "candidate claim factual rõ ràng từ caption metadata."
+                )
+                result.setdefault("metadata", {})[
+                    "caption_claim_fallback_used"
+                ] = True
+
+        result["source"] = "gemini_multimodal"
+        result["model"] = str(model_used or GEMINI_VISION_MODEL)
+        result["error"] = None
+
+        print(
+            "[FactCheck Multimedia] "
+            f"OK model={result['model']} "
+            f"claims={len(result.get('candidate_claims', []))}"
+        )
+
+        return result
+
+    # ========================================================
+    # ERROR FALLBACK
+    # ========================================================
+    except Exception as exc:
+        import traceback
+
+        print(
+            "[FactCheck Multimedia Error] "
+            f"{type(exc).__name__}: {exc}"
+        )
+        traceback.print_exc()
+
+        return _build_multimedia_fallback_result(
+            metadata,
+            source="multimedia_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+    finally:
+        if uploaded_file is not None:
+            try:
+                gemini_client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
